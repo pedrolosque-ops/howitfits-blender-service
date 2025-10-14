@@ -1,47 +1,60 @@
-from fastapi import FastAPI, UploadFile, Form, HTTPException, Header, Depends
-from fastapi.responses import FileResponse
-import subprocess, os, tempfile, shutil
+from fastapi import FastAPI, UploadFile, File, Form, Header, HTTPException
+from fastapi.responses import FileResponse, JSONResponse
+import os, tempfile, shutil, subprocess
 
 app = FastAPI()
 
-EXPECTED_TOKEN = os.getenv("AUTH_BEARER_TOKEN")
-
-def require_bearer(authorization: str = Header(None)):
-    if not EXPECTED_TOKEN:
-        raise HTTPException(status_code=500, detail="AUTH_BEARER_TOKEN not set on server")
-    if not authorization or not authorization.startswith("Bearer "):
-        raise HTTPException(status_code=401, detail="Missing Authorization header")
-    token = authorization.split(" ", 1)[1].strip()
-    if token != EXPECTED_TOKEN:
-        raise HTTPException(status_code=403, detail="Invalid token")
+def require_bearer(auth_header: str | None) -> None:
+    token_env = os.environ.get("BLENDER_SERVICE_TOKEN", "")
+    if not token_env:
+        raise HTTPException(status_code=500, detail="BLENDER_SERVICE_TOKEN not set")
+    if not auth_header or not auth_header.startswith("Bearer "):
+        raise HTTPException(status_code=401, detail="Missing Bearer token")
+    provided = auth_header.split(" ", 1)[1].strip()
+    if provided != token_env:
+        raise HTTPException(status_code=403, detail="Invalid Bearer token")
 
 @app.get("/health")
-def health():
-    return {"ok": True, "service": "howitfits-blender-service"}
+async def health():
+    return JSONResponse({"ok": True})
 
-def run_blender_scale(input_path: str, output_path: str, scale_factor: float):
+def run_blender_scale(input_path: str, output_path: str, axis: str, target_cm: float) -> None:
+    # Executa Blender headless chamando o script Python interno
     cmd = [
         "xvfb-run", "-a", "blender", "--background",
-        "--python", "scale_export.py", "--", input_path, output_path, str(scale_factor)
+        "--python", "scale_export.py", "--",
+        "--input", input_path,
+        "--output", output_path,
+        "--axis", axis.lower(),
+        "--target_cm", str(target_cm)
     ]
     result = subprocess.run(cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
     if result.returncode != 0:
-        raise RuntimeError(f"Blender error:\n{result.stderr}")
+        raise RuntimeError(f"Blender error:\nSTDOUT:\n{result.stdout}\n\nSTDERR:\n{result.stderr}")
 
-@app.post("/scale", dependencies=[Depends(require_bearer)])
+@app.post("/scale")
 async def scale_model(
-    model: UploadFile,
+    model: UploadFile = File(...),
     axis: str = Form("x"),
-    base_length_cm: float = Form(100),
-    target_length_cm: float = Form(100)
+    target_length_cm: float = Form(...)
+    ,
+    authorization: str | None = Header(default=None, convert_underscores=False)
 ):
+    # Auth
+    require_bearer(authorization)
+
+    # Validações básicas
+    axis = axis.lower()
+    if axis not in ("x", "y", "z"):
+        raise HTTPException(status_code=400, detail="axis must be one of x|y|z")
+    if target_length_cm is None or float(target_length_cm) <= 0:
+        raise HTTPException(status_code=400, detail="target_length_cm must be > 0")
+    if not model.filename.lower().endswith(".glb"):
+        # aceitamos somente GLB aqui; ajuste se quiser permitir GLTF
+        raise HTTPException(status_code=415, detail="Only .glb files are supported")
+
+    tmpdir = tempfile.mkdtemp(prefix="blender_scale_")
     try:
-        if target_length_cm <= 0 or base_length_cm <= 0:
-            raise HTTPException(status_code=400, detail="base_length_cm e target_length_cm devem ser > 0")
-
-        scale_factor = target_length_cm / base_length_cm
-
-        tmpdir = tempfile.mkdtemp()
         src_path = os.path.join(tmpdir, model.filename)
         with open(src_path, "wb") as f:
             f.write(await model.read())
@@ -49,10 +62,14 @@ async def scale_model(
         out_name = os.path.splitext(model.filename)[0] + "_scaled.glb"
         out_path = os.path.join(tmpdir, out_name)
 
-        run_blender_scale(src_path, out_path, scale_factor)
+        # Chama Blender para medir e escalar
+        run_blender_scale(src_path, out_path, axis, float(target_length_cm))
 
+        # Retorna o GLB processado
         return FileResponse(out_path, media_type="model/gltf-binary", filename=out_name)
 
+    except HTTPException:
+        raise
     except Exception as e:
         raise HTTPException(status_code=500, detail=str(e))
     finally:
