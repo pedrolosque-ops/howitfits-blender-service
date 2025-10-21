@@ -74,3 +74,6 @@ async def scale_model(
         raise HTTPException(status_code=500, detail=str(e))
     finally:
         shutil.rmtree(tmpdir, ignore_errors=True)
+@app.get("/health")
+async def health():
+  return {"ok": True}
