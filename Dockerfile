@@ -33,7 +33,8 @@ COPY . .
 
 EXPOSE 8080
 
+# --- HEALTHCHECK: use a porta que o Railway define ---
 HEALTHCHECK --interval=30s --timeout=5s --start-period=20s --retries=3 \
-  CMD bash -lc 'curl -fs "http://127.0.0.1:${PORT:-8080}/health" || exit 1'
-  
-CMD ["sh", "-c", "uvicorn server:app --host 0.0.0.0 --port ${PORT:-8080}"]
+  CMD curl -fs "http://localhost:${PORT}/health" || exit 1
+
+CMD ["sh", "-c", "uvicorn server:app --host 0.0.0.0 --port ${PORT}"]
